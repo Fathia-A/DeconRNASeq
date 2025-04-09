@@ -1,247 +1,209 @@
-# Part 1: Installation 
-
-#Download devtools
-
-install.packages("devtools")
-
-install.packages("tibble")  
-
-library(tibble)
-
-# Download CIBERSORT.R and LM22.txt
-
-dir.create("C:/Users/WA/Downloads/cibersort/CIBESORT.R", showWarnings = FALSE)
-
-# Download R script from a public GitHub repo
-
-download.file(
-  
-  url = "https://raw.githubusercontent.com/JingYangSciBio/Immu-Mela/master/CIBERSORT.R",
-  
-  destfile = "C:/Users/WA/Downloads/cibersort/CIBERSORT.R",
-  
-  mode = "wb"
-  
-)
-
-# Download LM22.txt
-
-download.file(
-  
-  url = "https://raw.githubusercontent.com/mdozmorov/Immuno_notes/master/data/Cibersoft/LM22.txt",
-  
-  destfile = "C:/Users/WA/Downloads/cibersort/LM22.txt",
-  
-  mode = "wb"
-  
-)
-
-# set the paths in immunedeconv
-
-library(immunedeconv)
-
-set_cibersort_binary("C:/Users/WA/Downloads/cibersort/CIBERSORT.R")
-set_cibersort_mat("C:/Users/WA/Downloads/cibersort/LM22.txt")
-
-
-# Inside R
-
-Sys.setenv(GITHUB_PAT = "ghp_personal token")
-
-# Install Immunedeconv
-
-devtools::install_local(".")
-
-# Load library(immunedeconv)
-
-library(immunedeconv)
-
-# List the methods
-
-names(deconvolution_methods)
-
-# Part 2: Download dataset from GSE93385 and GSE87750
-
-
-# Load GSE87750.raw.tar
-
-setwd("C:/Users/WA/Downloads/GSE87750_RAW/")
-
-# Part 3: Build a gene expression matrix from multiple sample-level FPKM files
-
-library(dplyr)
-
-# List all .fpkm_tracking files
-files <- list.files("C:/Users/WA/Downloads/GSE87750_RAW/")
-files
-############################Define a function to extract FPKM per sample#####################
-
-read_fpkm <- function(file) {
-  
-  dat <- read.delim(file)
-  sample_name <- tools::file_path_sans_ext(basename(file))
-  
-  sample_name <- sub(".fpkm_tracking", "", sample_name)
-  
-  dat <- dat[, c("gene_id", "FPKM")]
-  
-  dat <- dat[!is.na(dat$gene_id) & dat$gene_id != "", ]
-  
-  dat <- dat[!duplicated(dat$gene_id), ]
-  
-  tibble(gene = dat$gene_id, !!sample_name := dat$FPKM)
-  
+# -------------------------------------------------------------------
+# Part 1: Install Required Libraries
+# -------------------------------------------------------------------
+# Check if BiocManager is installed, and install it if necessary
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
 }
 
+# Install necessary libraries from Bioconductor
+BiocManager::install("MuSiC")
+BiocManager::install("SingleCellExperiment")
+BiocManager::install("Biobase")
+BiocManager::install("SummarizedExperiment")
 
-##################################Read and merge all samples into one matrix#######################
-
-expr_list <- lapply(files, read_fpkm)
-
-expr_matrix <- Reduce(function(x, y) full_join(x, y, by = "gene"), expr_list) %>%
-  
-  filter(!is.na(gene) & gene != "") %>%
-  
-  distinct(gene, .keep_all = TRUE) %>%
-  
-  as.data.frame()
+# Load MuSiC library after installation
+library(MuSiC)
 
 
+# -------------------------------------------------------------------
+# Part 2: Load and Prepare Data
+# -------------------------------------------------------------------
 
-rownames(expr_matrix) <- expr_matrix$gene
+## A) Load Bulk RNA-seq Matrix (GSE125554 dataset)
+# Read the CSV file containing the bulk RNA-seq expression data
+expr <- read.csv("GSE125554_zikv_counts.csv", row.names = 1)
 
+# Check the first few rows to ensure correct loading
+head(expr[, 1:4])
+dim(expr)  # Check dimensions
 
-expr_matrix$gene <- NULL
+# -------------------------------------------------------------------
+## B) Load Brain Single-Cell RNA-seq Reference (GSE104276 dataset)
+# -------------------------------------------------------------------
+# Load necessary libraries
+library(SingleCellExperiment)
+library(readxl)
 
-head(rownames(expr_matrix), 10)
+# Step 1: Load TPM Matrix from .xls File
+tpm_file <- "GSE104276_all_pfc_2394_UMI_TPM_NOERCC.xls"
 
+# Read the .xls file (cell x gene expression matrix)
+expr_matrix <- read.delim(tpm_file, row.names = 1, check.names = FALSE)
 
-##############################################Normalization########################################################
+# Convert to matrix format
+expr_matrix <- as.matrix(expr_matrix)
 
-install.packages("preprocessCore")
+# Check dimensions and headers
+dim(expr_matrix)
+head(colnames(expr_matrix))
+head(rownames(expr_matrix))
 
-library(preprocessCore)
+# Step 2: Load Metadata for Single-Cell Data
+meta_data <- read_xlsx("GSE104276_readme_sample_barcode.xlsx", sheet = "CellNameBarcodeID")
 
-# Convert to matrix
-mat <- as.matrix(expr_matrix)
+# View the metadata columns
+head(meta_data)
+colnames(meta_data)
 
-# Quantile normalize
-mat_norm <- normalize.quantiles(mat)
+# Reshape metadata from wide to long format (cell names only)
+library(tidyverse)
 
-# Preserve row and column names
-rownames(mat_norm) <- rownames(expr_matrix)
-colnames(mat_norm) <- colnames(expr_matrix)
+cell_name_cols <- meta_data %>% select(-starts_with("Barcode_ID"))
 
-# Convert back to data.frame if needed
-expr_matrix_normalized <- as.data.frame(mat_norm)
+meta_long <- cell_name_cols %>%
+  pivot_longer(cols = everything(),
+               names_to = "donor_id",
+               values_to = "cell_name") %>%
+  filter(!is.na(cell_name))
 
-# View a snippet
-head(expr_matrix_normalized[, 1:5])
+# Step 3: Add Cell Type Labels
+meta_types <- read_xlsx("GSE104276_readme_sample_barcode.xlsx", sheet = "PFC_NPCneuglia_monocle_ident")
+head(meta_types)
+colnames(meta_types)
 
-##################### comparison between the expression distribution before and after normalization
-boxplot(expr_matrix, 
-        las = 2, 
-        main = "Expression Distributions per Sample", 
-        outline = FALSE)
+# Rename ...1 column to cell_name for merging
+meta_types <- meta_types %>%
+  rename(cell_name = `...1`)
 
+# Merge metadata (donor and cell type info)
+metadata_final <- meta_long %>%
+  left_join(meta_types, by = "cell_name")
 
-boxplot(expr_matrix_normalized, 
-        las = 2, 
-        main = "Expression Distributions per Normalized Sample", 
-        outline = FALSE)
-############################################################ mapping #######################################3
-# Install biomaRt if you don't have it
-install.packages("biomaRt")
+# Check the cell types in the merged data
+table(metadata_final$cell_type)
 
-# Load biomaRt library
-library(biomaRt)
+# Clean metadata: Filter and remove NAs
+metadata_final <- metadata_final %>%
+  filter(cell_name %in% colnames(expr_matrix)) %>%
+  distinct(cell_name, .keep_all = TRUE) %>%
+  filter(!is.na(cell_name)) %>%
+  arrange(match(cell_name, colnames(expr_matrix)))
 
-# Connect to Ensembl database (use human genes)
-ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+# Final check to ensure no mismatch between cell names and expression matrix columns
+stopifnot(all(metadata_final$cell_name == colnames(expr_matrix)))
 
-# Map Ensembl IDs to HUGO Gene Symbols (if your gene IDs are Ensembl IDs)
-gene_map <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
-                  filters = "ensembl_gene_id", 
-                  values = rownames(expr_matrix_normalized),
-                  mart = ensembl)
-
-# Merge the gene map with expr_matrix
-expr_matrix$gene_id <- rownames(expr_matrix)
-
-expr_matrix_with_symbols <- merge(expr_matrix, gene_map, by.x = "gene_id", by.y = "ensembl_gene_id", all.x = TRUE)
-
-
-
-rownames(expr_matrix_with_symbols) <- expr_matrix_with_symbols$gene_id
-expr_matrix_with_symbols$gene_id <- NULL  # Remove the temporary gene_id column
-
-expr_matrix <- expr_matrix_with_symbols
-
-########################################################## lm22 quality check ####################
-
-
-# Reload original LM22 to get back the gene names
-lm22 <- read.delim("C:/Users/WA/Downloads/cibersort/LM22_fixed.txt", check.names = FALSE)
-
-# Optional: Rename first column to "GeneSymbol"
-colnames(lm22)[1] <- "GeneSymbol" 
-
-# Convert all other columns to numeric safely
-lm22[, -1] <- sapply(lm22[, -1], as.numeric)
-
-# Replace NA values with 0
-lm22[is.na(lm22)] <- 0
-
-# Sanity check – make sure GeneSymbol column still has text
-head(lm22$GeneSymbol)
-
-
-# Save it
-write.table(lm22,
-            file = "C:/Users/WA/Downloads/cibersort/LM22_fixed.txt",
-            sep = "\t",
-            row.names = FALSE,
-            quote = FALSE)
-
-########################################### Filter to LM22 genes ####################################
-lm22_genes <- lm22[1]
-
-sum(rownames(expr_matrix) %in% lm22_genes)
-
-
-expr_matrix_filtered <- expr_matrix[rownames(expr_matrix) %in% lm22_genes, ]
-
-
-# Ensure numeric matrix and clean formatting
-expr_matrix_filtered <- expr_matrix_filtered[complete.cases(expr_matrix_filtered), ]
-expr_matrix_filtered <- expr_matrix_filtered[!duplicated(rownames(expr_matrix_filtered)), ]
-expr_matrix_filtered <- as.matrix(expr_matrix_filtered)
-storage.mode(expr_matrix_filtered) <- "numeric"
-
-# Write filtered expression matrix to a text file for CIBERSORT
-write.table(expr_matrix_filtered,
-            file = "C:/Users/WA/Downloads/cibersort/expr_for_cibersort.txt",
-            sep = "\t",
-            row.names = FALSE,
-            quote = FALSE)
-
-######################################### Run CIBERSORT ####################################
-
-# Load the CIBERSORT R script
-source("C:/Users/WA/Downloads/cibersort/CIBERSORT.R")
-
-# Run CIBERSORT
-results <- CIBERSORT(
-  sig_matrix = "C:/Users/WA/Downloads/cibersort/LM22_fixed.txt",
-  mixture_file = "C:/Users/WA/Downloads/cibersort/expr_for_cibersort.txt",
-  perm = 100,
-  QN = FALSE  # for RNA-seq
+# -------------------------------------------------------------------
+# Part 3: Build a SingleCellExperiment Object
+# -------------------------------------------------------------------
+# Create SingleCellExperiment (SCE) object
+sce <- SingleCellExperiment(
+  assays = list(counts = expr_matrix),
+  colData = data.frame(
+    cell_type = metadata_final$cell_type,
+    donor_id = metadata_final$donor_id,
+    row.names = metadata_final$cell_name
+  )
 )
 
-# View results
-head(results)
+# Save the SingleCellExperiment object to disk
+saveRDS(sce, "GSE104276_sce.rds")
 
 
+# -------------------------------------------------------------------
+# Part 4: Deconvolution using MuSiC
+# -------------------------------------------------------------------
+# Load the SCE object for MuSiC
+sce <- readRDS("GSE104276_sce.rds")
+
+# Load Bulk RNA-seq Expression Data
+expr <- read.csv("GSE125554_zikv_counts.csv", row.names = 1)
+
+# Intersect genes between single-cell and bulk datasets
+common_genes <- intersect(rownames(sce), rownames(expr))
+
+# Filter both matrices to include only common genes
+expr <- expr[common_genes, ]
+sce <- sce[common_genes, ]
+
+# -------------------------------------------------------------------
+# Step 1: Convert Ensembl IDs to Gene Symbols (if needed)
+# -------------------------------------------------------------------
+# If your bulk dataset uses Ensembl IDs while the reference uses gene symbols,
+# we need to map the Ensembl IDs to gene symbols using the biomaRt package.
+
+library(biomaRt)
+
+# Connect to Ensembl database
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Retrieve mapping between Ensembl IDs and gene symbols
+id_mapping <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = rownames(expr),
+  mart = mart
+)
+
+# Clean up the mapping: Remove duplicates and empty gene symbols
+id_mapping <- id_mapping[!duplicated(id_mapping$ensembl_gene_id), ]
+id_mapping <- id_mapping[id_mapping$hgnc_symbol != "", ]
+
+# Add gene symbols to the expr matrix
+expr$gene_symbol <- id_mapping$hgnc_symbol[match(rownames(expr), id_mapping$ensembl_gene_id)]
+
+# Filter out rows with missing or invalid gene symbols
+expr <- expr[!is.na(expr$gene_symbol) & expr$gene_symbol != "", ]
+
+# Collapse duplicates by summing counts for the same gene symbol
+expr <- expr %>%
+  group_by(gene_symbol) %>%
+  summarise(across(where(is.numeric), sum), .groups = "drop") %>%
+  as.data.frame()
+
+# Set the gene symbols as rownames and remove the gene_symbol column
+rownames(expr) <- expr$gene_symbol
+expr$gene_symbol <- NULL
 
 
+# -------------------------------------------------------------------
+# Part 5: Run MuSiC for Deconvolution
+# -------------------------------------------------------------------
+# Load MuSiC after installation
+library(MuSiC)
 
+# Rename the assay to "counts" for consistency
+assayNames(sce) <- "counts"
+
+# Run MuSiC Deconvolution
+music_results <- music_prop(
+  bulk.mtx = as.matrix(expr),
+  sc.sce = sce,
+  clusters = 'cell_type',  # Column containing cell types
+  samples = 'donor_id',    # Column containing sample/donor IDs
+  verbose = TRUE
+)
+
+# Inspect the deconvolution results (cell type proportions)
+head(music_results$Est.prop.weighted)
+str(music_results$Est.prop.weighted)
+
+
+# -------------------------------------------------------------------
+# Part 6: Data Visualization
+# -------------------------------------------------------------------
+# Replace NAs in cell type proportions with "Unknown"
+colnames(music_results$Est.prop.weighted)[is.na(colnames(music_results$Est.prop.weighted))] <- "Unknown"
+
+# Convert results into a long format for plotting
+library(ggplot2)
+df <- as.data.frame(music_results$Est.prop.weighted)
+df$Sample <- rownames(df)
+
+df_long <- pivot_longer(df, -Sample, names_to = "CellType", values_to = "Proportion")
+
+# Create bar plot of estimated cell type proportions
+ggplot(df_long, aes(x = Sample, y = Proportion, fill = CellType)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Estimated Cell Type Proportions from MuSiC")
